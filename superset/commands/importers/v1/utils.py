@@ -318,38 +318,54 @@ def import_tag(
 
     for tag_name in target_tag_names:
         try:
-            tag = existing_tags.get(tag_name)
+            # Each tag is written inside a SAVEPOINT so that a conflict raised by a
+            # concurrent import only undoes this tag's statements; the session stays
+            # usable and work staged earlier in the import is preserved.
+            with db_session.begin_nested():
+                tag = existing_tags.get(tag_name)
 
-            # If tag does not exist, create it
-            if tag is None:
-                description = tag_descriptions.get(tag_name, None)
-                tag = Tag(name=tag_name, description=description, type="custom")
-                db_session.add(tag)
-                existing_tags[tag_name] = tag  # Update the existing_tags dictionary
+                # If tag does not exist, create it
+                if tag is None:
+                    description = tag_descriptions.get(tag_name, None)
+                    tag = Tag(name=tag_name, description=description, type="custom")
+                    db_session.add(tag)
+                    db_session.flush()  # assign ``tag.id`` for the association below
+                    existing_tags[tag_name] = tag
 
-            # Ensure the association with the object
-            tagged_object = (
-                db_session.query(TaggedObject)
-                .filter_by(object_id=object_id, object_type=object_type, tag_id=tag.id)
-                .first()
-            )
-            if not tagged_object:
-                new_tagged_object = TaggedObject(
-                    tag_id=tag.id, object_id=object_id, object_type=object_type
+                # Ensure the association with the object
+                tagged_object = (
+                    db_session.query(TaggedObject)
+                    .filter_by(
+                        object_id=object_id, object_type=object_type, tag_id=tag.id
+                    )
+                    .first()
                 )
-                db_session.add(new_tagged_object)
+                if not tagged_object:
+                    new_tagged_object = TaggedObject(
+                        tag_id=tag.id, object_id=object_id, object_type=object_type
+                    )
+                    db_session.add(new_tagged_object)
+                    db_session.flush()
 
             new_tag_ids.append(tag.id)
 
         except SQLAlchemyError as err:
-            logger.error(
+            logger.warning(
                 "Error processing tag '%s' for %s ID %d: %s",
                 tag_name,
                 object_type,
                 object_id,
                 err,
             )
-            continue  # No need for manual rollback, handled by transaction decorator
+            # The SAVEPOINT was rolled back, which also discards any object added
+            # inside it, so the cached tag may no longer be attached to the session.
+            existing_tags.pop(tag_name, None)
+
+            if tag_id := _recover_tag_association(
+                db_session, tag_name, object_id, object_type
+            ):
+                new_tag_ids.append(tag_id)
+            continue
 
     # Remove old tags not in the new config
     for tag in existing_assocs:
@@ -357,6 +373,50 @@ def import_tag(
             db_session.delete(tag)
 
     return new_tag_ids
+
+
+def _recover_tag_association(
+    db_session: Session,
+    tag_name: str,
+    object_id: int,
+    object_type: str,
+) -> int | None:
+    """Re-read a tag association after a conflict, creating it if still missing.
+
+    Called after a SAVEPOINT rollback, when a concurrent import may have committed
+    the very rows this import was trying to write. Returns the tag ID when the
+    association exists (or could be created), so that the caller does not treat it
+    as stale and delete it.
+    """
+    try:
+        tag = db_session.query(Tag).filter_by(name=tag_name).first()
+        if tag is None:
+            return None
+
+        tagged_object = (
+            db_session.query(TaggedObject)
+            .filter_by(object_id=object_id, object_type=object_type, tag_id=tag.id)
+            .first()
+        )
+        if tagged_object is None:
+            with db_session.begin_nested():
+                db_session.add(
+                    TaggedObject(
+                        tag_id=tag.id, object_id=object_id, object_type=object_type
+                    )
+                )
+                db_session.flush()
+
+        return tag.id
+    except SQLAlchemyError as err:
+        logger.warning(
+            "Unable to recover tag '%s' for %s ID %d: %s",
+            tag_name,
+            object_type,
+            object_id,
+            err,
+        )
+        return None
 
 
 def safe_insert_dashboard_chart_relationships(
