@@ -48,6 +48,7 @@ from superset.utils.core import (
 )
 from superset.utils.hashing import hash_from_dict
 from superset.utils.json import json_int_dttm_ser
+from superset.utils.pandas_postprocessing.utils import drop_unsupported_options
 
 if TYPE_CHECKING:
     from superset.connectors.sqla.models import BaseDatasource
@@ -536,5 +537,14 @@ class QueryObject:  # pylint: disable=too-many-instance-attributes
                         )
                     )
                 options = post_process.get("options", {})
-                df = getattr(pandas_postprocessing, operation)(df, **options)
+                func = getattr(pandas_postprocessing, operation)
+                options, dropped = drop_unsupported_options(func, options)
+                if dropped:
+                    logger.warning(
+                        "Ignoring unsupported option(s) %s for post processing "
+                        "operation %s",
+                        ", ".join(sorted(dropped)),
+                        operation,
+                    )
+                df = func(df, **options)
             return df
