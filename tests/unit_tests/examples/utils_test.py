@@ -20,6 +20,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
 
 
@@ -151,6 +152,58 @@ def test_load_contents_replaces_sqlalchemy_examples_uri_placeholder():
         assert "databases/examples.yaml" in contents
         assert test_uri in contents["databases/examples.yaml"]
         assert "__SQLALCHEMY_EXAMPLES_URI__" not in contents["databases/examples.yaml"]
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_rejects_python_object_tags(mock_command_cls):
+    """Metadata must be parsed as data, never instantiated as Python objects.
+
+    A metadata.yaml carrying a `!!python/object/apply` tag is a code execution
+    vector when parsed with a non-safe loader, so parsing must fail instead.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "metadata.yaml").write_text(
+            "!!python/object/apply:os.system\nargs: ['touch /tmp/pwned']\n"
+        )
+
+        with pytest.raises(yaml.constructor.ConstructorError):
+            load_configs_from_directory(root)
+
+    mock_command_cls.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_parses_ordinary_metadata(mock_command_cls):
+    """Ordinary metadata still parses, and the "type" key is stripped."""
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "metadata.yaml").write_text(
+            yaml.dump(
+                {
+                    "version": "1.0.0",
+                    "type": "Dashboard",
+                    "timestamp": "2020-12-11T22:52:56.534241+00:00",
+                }
+            )
+        )
+
+        load_configs_from_directory(root)
+
+    contents = mock_command_cls.call_args[0][0]
+    metadata = yaml.safe_load(contents["metadata.yaml"])
+    assert metadata == {
+        "version": "1.0.0",
+        "timestamp": "2020-12-11T22:52:56.534241+00:00",
+    }
+    mock_command.run.assert_called_once()
 
 
 @patch("superset.examples.utils.ImportExamplesCommand")
