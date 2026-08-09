@@ -14,9 +14,10 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+import inspect
 from collections.abc import Sequence
-from functools import partial
-from typing import Any, Callable
+from functools import lru_cache, partial, wraps
+from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -122,6 +123,7 @@ def scalar_to_sequence(val: Any) -> Sequence[str]:
 
 def validate_column_args(*argnames: str) -> Callable[..., Any]:
     def wrapper(func: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(func)
         def wrapped(df: DataFrame, **options: Any) -> Any:
             if _is_multi_index_on_columns(df):
                 # MultiIndex column validate first level
@@ -140,6 +142,53 @@ def validate_column_args(*argnames: str) -> Callable[..., Any]:
         return wrapped
 
     return wrapper
+
+
+@lru_cache(maxsize=None)
+def _supported_options(operation: Callable[..., Any]) -> Optional[frozenset[str]]:
+    """
+    Names of the keyword options accepted by a post processing operation.
+
+    :param operation: the post processing function
+    :return: the accepted option names, or `None` if the operation accepts
+             arbitrary keyword arguments
+    """
+    parameters = list(inspect.signature(operation).parameters.values())
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters):
+        return None
+    return frozenset(
+        param.name
+        # the first parameter is the DataFrame, which is passed positionally
+        for param in parameters[1:]
+        if param.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    )
+
+
+def drop_unsupported_options(
+    operation: Callable[..., Any], options: dict[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    """
+    Remove options that the post processing operation no longer accepts.
+
+    Chart definitions are persisted verbatim in `slices.query_context` and replayed
+    by every non-Explore consumer, so they can reference parameters that were
+    removed from an operation by a later version of Superset. Ignoring these stale
+    parameters keeps such charts renderable.
+
+    :param operation: the post processing function
+    :param options: the options stored alongside the operation
+    :return: the supported options and the names of the dropped ones
+    """
+    supported = _supported_options(operation)
+    if supported is None:
+        return options, []
+    dropped = [name for name in options if name not in supported]
+    if not dropped:
+        return options, []
+    return {
+        name: value for name, value in options.items() if name in supported
+    }, dropped
 
 
 def _get_aggregate_funcs(
